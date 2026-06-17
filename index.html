@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hand Track Rectangle</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      overflow: hidden;
+      background: #000;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #webcam {
+      position: fixed;
+      top: 0; left: 0;
+      width: 1px; height: 1px;
+      opacity: 0;
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    #overlay {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      z-index: 2;
+    }
+
+    /* Loading splash */
+    #loader {
+      position: fixed; inset: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,.85);
+      color: #fff;
+      font-family: system-ui, sans-serif;
+      font-size: 1.1rem;
+      letter-spacing: .04em;
+      transition: opacity .6s;
+    }
+    #loader.hidden { opacity: 0; pointer-events: none; }
+    .spinner {
+      width: 28px; height: 28px;
+      border: 3px solid rgba(255,255,255,.15);
+      border-top-color: #0ff;
+      border-radius: 50%;
+      margin-right: 14px;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+  <div id="loader"><div class="spinner"></div>Loading hand tracker…</div>
+
+  <video id="webcam" autoplay playsinline></video>
+  <canvas id="overlay"></canvas>
+
+  <script type="module">
+    // ── MediaPipe Tasks-Vision via CDN ──
+    import {
+      FilesetResolver,
+      HandLandmarker
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
+
+    // ── Landmark indices we care about ──
+    const INDEX_TIP = 8;
+    const THUMB_TIP = 4;
+
+    // ── DOM refs ──
+    const video  = document.getElementById("webcam");
+    const canvas = document.getElementById("overlay");
+    const ctx    = canvas.getContext("2d");
+    const loader = document.getElementById("loader");
+
+    // ── Smoothing state (EMA) ──
+    const SMOOTH = 0.45;                        // 0 = no smooth, 1 = frozen
+    let smooth = [null, null, null, null];       // [LI, LT, RT, RI]
+
+    function ema(prev, cur) {
+      if (!prev) return cur;
+      return {
+        x: prev.x * SMOOTH + cur.x * (1 - SMOOTH),
+        y: prev.y * SMOOTH + cur.y * (1 - SMOOTH)
+      };
+    }
+
+    // ── Effect mode cycling ──
+    const EFFECTS = ["invert", "pixelate", "comic"];
+    let effectIdx  = 0;
+    let pinchActive = false;              // true while both hands are pinching
+    let pinchCooldown = 0;                // timestamp – ignore new pinches until this
+    let isTwisted = false;                // true when polygon is crossed
+    let twistCooldown = 0;                // debounce for untwist detection
+    const PINCH_DIST  = 0.07;             // normalised distance threshold
+    const PINCH_COOLDOWN_MS = 600;
+
+    function isPinching(hand) {
+      const dx = hand[THUMB_TIP].x - hand[INDEX_TIP].x;
+      const dy = hand[THUMB_TIP].y - hand[INDEX_TIP].y;
+      return Math.hypot(dx, dy) < PINCH_DIST;
+    }
+
+    // ── Offscreen canvas for pixelation ──
+    const offscreen = document.createElement("canvas");
+    const offCtx    = offscreen.getContext("2d");
+    const PIXEL_SIZE = 12;                // block size in pixels
+    const DOT_SIZE   = 8;                 // halftone grid spacing
+
+    // ── Resize canvas to match window ──
+    function resize() {
+      canvas.width  = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    // ── Compute cover-fit source rect (reusable) ──
+    function coverRect(W, H) {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (!vw || !vh) return null;
+      const canvasRatio = W / H;
+      const videoRatio  = vw / vh;
+      let sx, sy, sw, sh;
+      if (videoRatio > canvasRatio) {
+        sh = vh; sw = vh * canvasRatio;
+        sx = (vw - sw) / 2; sy = 0;
+      } else {
+        sw = vw; sh = vw / canvasRatio;
+        sx = 0; sy = (vh - sh) / 2;
+      }
+      return { sx, sy, sw, sh };
+    }
+
+    // ── Draw mirrored video covering the canvas ──
+    function drawVideo(filterStr) {
+      const W = canvas.width, H = canvas.height;
+      const r = coverRect(W, H);
+      if (!r) return;
+
+      ctx.save();
+      if (filterStr) ctx.filter = filterStr;
+      ctx.translate(W, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, r.sx, r.sy, r.sw, r.sh, 0, 0, W, H);
+      ctx.restore();
+    }
+
+    // ── Draw pixelated mirrored video ──
+    function drawVideoPixelated() {
+      const W = canvas.width, H = canvas.height;
+      const r = coverRect(W, H);
+      if (!r) return;
+
+      // draw tiny version
+      const tw = Math.ceil(W / PIXEL_SIZE);
+      const th = Math.ceil(H / PIXEL_SIZE);
+      offscreen.width  = tw;
+      offscreen.height = th;
+
+      offCtx.save();
+      offCtx.translate(tw, 0);
+      offCtx.scale(-1, 1);
+      offCtx.drawImage(video, r.sx, r.sy, r.sw, r.sh, 0, 0, tw, th);
+      offCtx.restore();
+
+      // scale back up with no smoothing → blocky pixels
+      ctx.save();
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(offscreen, 0, 0, tw, th, 0, 0, W, H);
+      ctx.restore();
+    }
+
+    // ── Draw comic-book halftone effect ──
+    function drawVideoComic() {
+      const W = canvas.width, H = canvas.height;
+      const cr = coverRect(W, H);
+      if (!cr) return;
+
+      // sample video at reduced resolution
+      const cols = Math.ceil(W / DOT_SIZE);
+      const rows = Math.ceil(H / DOT_SIZE);
+      offscreen.width  = cols;
+      offscreen.height = rows;
+
+      offCtx.save();
+      offCtx.translate(cols, 0);
+      offCtx.scale(-1, 1);
+      offCtx.drawImage(video, cr.sx, cr.sy, cr.sw, cr.sh, 0, 0, cols, rows);
+      offCtx.restore();
+
+      const imgData = offCtx.getImageData(0, 0, cols, rows);
+      const px = imgData.data;
+
+      // cream paper background
+      ctx.fillStyle = "#f5f0e0";
+      ctx.fillRect(0, 0, W, H);
+
+      // draw halftone dots
+      const half = DOT_SIZE / 2;
+      const maxR = DOT_SIZE * 0.58;
+
+      for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+          const i = (row * cols + col) * 4;
+          let r = px[i], g = px[i + 1], b = px[i + 2];
+
+          // posterize to 4 bold levels
+          r = Math.round(r / 80) * 80;
+          g = Math.round(g / 80) * 80;
+          b = Math.round(b / 80) * 80;
+
+          // boost saturation for comic pop
+          const avg = (r + g + b) / 3;
+          r = Math.min(255, Math.round(avg + (r - avg) * 1.8));
+          g = Math.min(255, Math.round(avg + (g - avg) * 1.8));
+          b = Math.min(255, Math.round(avg + (b - avg) * 1.8));
+
+          // brightness → dot size (darker = bigger)
+          const lum = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+          const radius = maxR * (1 - lum * 0.85);
+
+          if (radius < 0.8) continue;
+
+          ctx.fillStyle = `rgb(${r},${g},${b})`;
+          ctx.beginPath();
+          ctx.arc(col * DOT_SIZE + half, row * DOT_SIZE + half, radius, 0, 6.283);
+          ctx.fill();
+        }
+      }
+    }
+
+    // ── Helper to draw an effect within a polygon ──
+    function fillPolygonWithEffect(pts, effectName) {
+      if (!pts || pts.length < 3) return;
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.closePath();
+      ctx.clip();
+
+      if (effectName === "invert") {
+        drawVideo("invert(1)");
+      } else if (effectName === "pixelate") {
+        drawVideoPixelated();
+      } else if (effectName === "comic") {
+        drawVideoComic();
+      }
+      ctx.restore();
+    }
+
+    // ── Start webcam ──
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
+      video.srcObject = stream;
+      await video.play();
+    }
+
+    // ── Initialise MediaPipe ──
+    async function init() {
+      await startCamera();
+
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+      );
+
+      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        numHands: 2,
+        runningMode: "VIDEO"
+      });
+
+      loader.classList.add("hidden");
+
+      // ── Render loop ──
+      let lastTime = -1;
+
+      function frame() {
+        requestAnimationFrame(frame);
+        if (video.currentTime === lastTime) return;
+        lastTime = video.currentTime;
+
+        const results = handLandmarker.detectForVideo(video, performance.now());
+        const W = canvas.width;
+        const H = canvas.height;
+        ctx.clearRect(0, 0, W, H);
+
+        // always draw the normal camera feed
+        drawVideo(null);
+
+        if (!results.landmarks || results.landmarks.length === 0) return;
+
+        // ── Classify hands: left vs right ──
+        // MediaPipe returns handedness labels; because the video is mirrored
+        // the label "Left" actually appears on the viewer's right, etc.
+        let leftHand  = null;   // viewer's left  (label "Right")
+        let rightHand = null;   // viewer's right  (label "Left")
+
+        for (let i = 0; i < results.landmarks.length; i++) {
+          const label = results.handednesses[i][0].categoryName;
+          // Mirror-flip: MediaPipe "Right" → viewer's left hand on screen
+          if (label === "Right") leftHand  = results.landmarks[i];
+          if (label === "Left")  rightHand = results.landmarks[i];
+        }
+
+        // ── Dual-pinch detection ──
+        const now = performance.now();
+        if (leftHand && rightHand) {
+          const bothPinch = isPinching(leftHand) && isPinching(rightHand);
+          if (bothPinch && !pinchActive && now > pinchCooldown) {
+            effectIdx = (effectIdx + 1) % EFFECTS.length;
+            pinchCooldown = now + PINCH_COOLDOWN_MS;
+            pinchActive = true;
+          }
+          if (!bothPinch) pinchActive = false;
+        } else {
+          pinchActive = false;
+        }
+
+        // Build raw points array: [Left Index, Left Thumb, Right Thumb, Right Index]
+        const raw = [null, null, null, null];
+
+        if (leftHand) {
+          raw[0] = { x: (1 - leftHand[INDEX_TIP].x) * W, y: leftHand[INDEX_TIP].y * H };
+          raw[1] = { x: (1 - leftHand[THUMB_TIP].x) * W, y: leftHand[THUMB_TIP].y * H };
+        }
+        if (rightHand) {
+          raw[2] = { x: (1 - rightHand[THUMB_TIP].x) * W, y: rightHand[THUMB_TIP].y * H };
+          raw[3] = { x: (1 - rightHand[INDEX_TIP].x) * W, y: rightHand[INDEX_TIP].y * H };
+        }
+
+        // ── Smooth ──
+        for (let i = 0; i < 4; i++) {
+          if (raw[i]) smooth[i] = ema(smooth[i], raw[i]);
+          // if hand disappears, keep last known pos for a beat
+        }
+
+        // ── Gather available vertices ──
+        const pts = smooth.filter(p => p !== null);
+
+        // ── Detect hourglass twist ──
+        let ix = null, ix2 = null, activeIx = null, twistType = 0;
+        if (pts.length === 4) {
+          ix = lineIntersection(pts[0], pts[1], pts[2], pts[3]);
+          ix2 = lineIntersection(pts[1], pts[2], pts[3], pts[0]);
+          if (ix) { activeIx = ix; twistType = 1; }
+          else if (ix2) { activeIx = ix2; twistType = 2; }
+        }
+
+        const currentlyTwisted = !!activeIx;
+
+        if (isTwisted && !currentlyTwisted && now > twistCooldown) {
+          // Untwisted! Advance cycle
+          effectIdx = (effectIdx + 1) % EFFECTS.length;
+          twistCooldown = now + 400; // 400ms debounce
+        }
+        isTwisted = currentlyTwisted;
+
+        // ── Apply active effect(s) inside the polygon/triangles ──
+        const currentEffect = EFFECTS[effectIdx];
+        const nextEffect = EFFECTS[(effectIdx + 1) % EFFECTS.length];
+
+        if (currentlyTwisted) {
+          if (twistType === 1) { // 0-1 crosses 2-3
+            fillPolygonWithEffect([pts[0], activeIx, pts[3]], currentEffect);
+            fillPolygonWithEffect([pts[1], pts[2], activeIx], nextEffect);
+          } else { // 1-2 crosses 3-0
+            fillPolygonWithEffect([pts[1], activeIx, pts[0]], currentEffect);
+            fillPolygonWithEffect([pts[2], pts[3], activeIx], nextEffect);
+          }
+        } else if (pts.length >= 3) {
+          // Normal polygon
+          fillPolygonWithEffect(pts, currentEffect);
+        }
+
+        // ── Draw connecting lines (if ≥ 2 points) ──
+        if (pts.length >= 2) {
+          ctx.save();
+          ctx.lineWidth   = 2.5;
+          ctx.strokeStyle = "rgba(0,255,255,.7)";
+          ctx.shadowColor = "#0ff";
+          ctx.shadowBlur  = 18;
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+          ctx.closePath();
+          ctx.stroke();
+
+          // second pass – brighter inner line
+          ctx.lineWidth   = 1;
+          ctx.strokeStyle = "rgba(255,255,255,.85)";
+          ctx.shadowBlur  = 0;
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // ── Draw intersection spark if hourglass ──
+        if (activeIx) {
+          drawSpark(activeIx);
+        }
+
+        // ── Draw circles on vertices ──
+        for (const p of pts) {
+          ctx.save();
+          ctx.shadowColor = "#0ff";
+          ctx.shadowBlur  = 22;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 10, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(0,255,255,.85)";
+          ctx.fill();
+          // white inner dot
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+          ctx.fillStyle = "#fff";
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+
+      requestAnimationFrame(frame);
+    }
+
+    // ── Line-segment intersection (returns point or null) ──
+    function lineIntersection(a, b, c, d) {
+      const dx1 = b.x - a.x, dy1 = b.y - a.y;
+      const dx2 = d.x - c.x, dy2 = d.y - c.y;
+      const denom = dx1 * dy2 - dy1 * dx2;
+      if (Math.abs(denom) < 1e-6) return null;
+      const t = ((c.x - a.x) * dy2 - (c.y - a.y) * dx2) / denom;
+      const u = ((c.x - a.x) * dy1 - (c.y - a.y) * dx1) / denom;
+      if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+      return { x: a.x + t * dx1, y: a.y + t * dy1 };
+    }
+
+    // ── Glowing intersection spark ──
+    function drawSpark(pt) {
+      if (!pt) return;
+      ctx.save();
+      const grad = ctx.createRadialGradient(pt.x, pt.y, 0, pt.x, pt.y, 22);
+      grad.addColorStop(0, "rgba(255,255,255,.9)");
+      grad.addColorStop(.3, "rgba(0,255,255,.6)");
+      grad.addColorStop(1, "rgba(0,255,255,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 22, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    init().catch(err => {
+      loader.textContent = "⚠ " + err.message;
+      console.error(err);
+    });
+  </script>
+</body>
+</html>
